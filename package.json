@@ -1,0 +1,27 @@
+{
+  "name": "@subnomic/bugfree-js",
+  "version": "0.1.0",
+  "description": "bugfree SDK for browser applications, with Vue, React or no framework",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": ["bugfree", "error-tracking", "monitoring", "browser", "javascript", "vue", "react", "source-maps"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subnomic/bugfree-js-sdk.git"
+  },
+  "homepage": "https://github.com/subnomic/bugfree-js-sdk#readme",
+  "bugs": "https://github.com/subnomic/bugfree-js-sdk/issues",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Subnomic",
+  "publishConfig": {
+    "access": "public"
+  }
+}
