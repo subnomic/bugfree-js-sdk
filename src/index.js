@@ -24,7 +24,7 @@ import { resolve_frame } from './source-map.js'
 import { create_transport } from './transport.js'
 import { create_breadcrumbs } from './breadcrumbs.js'
 
-export const VERSION = '0.1.0'
+export const VERSION = '0.1.1'
 
 /** Parses a DSN: http://<key>@host[/ingest] */
 export function parse_dsn(dsn) {

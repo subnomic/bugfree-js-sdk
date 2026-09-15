@@ -123,3 +123,7 @@ bugfree repository's Releases page with the new tag `sdk-js-v0.2.0` on `main`.
 The release workflow checks that both versions match the tag, runs the tests,
 pushes this directory to that repository as one commit, tags it there as
 `v0.2.0` and publishes the package to npm.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).
