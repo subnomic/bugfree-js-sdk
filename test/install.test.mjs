@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { browser_runtime, create_bugfree } from '../src/index.js'
+import { browser_runtime, create_bugfree, error_chain } from '../src/index.js'
 
 /**
  * Verifies that the handlers install() sets up really produce events.
@@ -21,6 +21,7 @@ const CHROME_UA =
 function fake_browser({ user_agent = CHROME_UA } = {}) {
   const listeners = {}
   const sent = []
+  const sessions = []
 
   globalThis.window = {
     addEventListener: (name, handler) => {
@@ -37,12 +38,18 @@ function fake_browser({ user_agent = CHROME_UA } = {}) {
   })
   globalThis.location = { pathname: '/debug', search: '', origin: 'http://localhost:3000' }
   globalThis.fetch = async (url, options) => {
+    // Session reports are counted apart from the events they accompany.
+    if (url.endsWith('/sessions')) {
+      sessions.push(JSON.parse(options.body).sessions[0])
+      return { ok: true, status: 202, json: async () => ({}) }
+    }
     sent.push({ url, body: JSON.parse(options.body) })
     return { ok: true, status: 202, json: async () => ({ event_id: 'x' }) }
   }
 
   return {
     sent,
+    sessions,
     /** Fires a registered global handler. */
     emit: (name, event) => {
       const handlers = listeners[name] || []
@@ -185,4 +192,175 @@ test('browser_runtime clips a value it does not recognize', () => {
   const long = 'x'.repeat(400)
   assert.equal(browser_runtime(long).length, 80)
   assert.equal(browser_runtime(''), '')
+})
+
+test('capture resolves to the event id, which the sent event carries', async () => {
+  const browser = fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  const pending = client.capture_exception(new Error('with an id'))
+  const immediate = client.last_event_id()
+  const id = await pending
+
+  assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(immediate, id, 'last_event_id() has the id before delivery')
+  assert.equal(browser.sent[0].body.event_id, id)
+})
+
+test('a repeated error resolves to null and keeps the previous id', async () => {
+  fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  const error = new Error('repeated')
+  const first = await client.capture_exception(error)
+  const second = await client.capture_exception(error)
+
+  assert.equal(second, null)
+  assert.equal(client.last_event_id(), first)
+})
+
+test('the cause chain is sent with the event', async () => {
+  const browser = fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  const root = new TypeError('response.json is not a function')
+  const middle = new Error('order could not be loaded', { cause: root })
+  await client.capture_exception(new Error('checkout failed', { cause: middle }))
+
+  assert.deepEqual(browser.sent[0].body.extra.error_chain, [
+    { type: 'Error', message: 'order could not be loaded' },
+    { type: 'TypeError', message: 'response.json is not a function' },
+  ])
+})
+
+test('error_chain stops at a cycle and describes a cause that is not an Error', () => {
+  const first = new Error('first')
+  const second = new Error('second', { cause: first })
+  first.cause = second
+
+  assert.deepEqual(error_chain(first), [{ type: 'Error', message: 'second' }])
+  assert.deepEqual(error_chain(new Error('coded', { cause: { code: 42 } })), [{ type: 'object', message: '{"code":42}' }])
+  assert.deepEqual(error_chain(new Error('plain')), [])
+})
+
+test('leaving the page hands queued events to sendBeacon', async () => {
+  const browser = fake_browser()
+  const beacons = []
+  navigator.sendBeacon = (url, blob) => {
+    beacons.push(url)
+    return true
+  }
+  // The first request never answers, so the next events stay queued behind it.
+  globalThis.fetch = () => new Promise(() => {})
+
+  const client = new_client()
+  client.install(fake_app())
+
+  client.capture_message('in flight')
+  client.capture_message('queued one')
+  client.capture_message('queued two')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+
+  browser.emit('pagehide', {})
+  assert.equal(beacons.length, 2)
+  assert.equal(beacons[0], 'http://localhost:3000/ingest/v1/public-key/store')
+})
+
+test('ignore_errors and deny_urls drop matching errors', async () => {
+  const browser = fake_browser()
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    resolve_source_maps: false,
+    ignore_errors: ['ResizeObserver loop', /^AbortError:/],
+    deny_urls: [/^chrome-extension:\/\//, 'https://widget.example.com/'],
+  })
+  client.install(fake_app())
+
+  await client.capture_exception(new Error('ResizeObserver loop completed with undelivered notifications'))
+  const aborted = new Error('The user aborted a request.')
+  aborted.name = 'AbortError'
+  await client.capture_exception(aborted)
+  await client.capture_message('ResizeObserver loop limit exceeded')
+
+  const from_extension = new Error('extension blew up')
+  from_extension.stack = 'Error: extension blew up\n    at run (chrome-extension://abcdef/content.js:1:10)'
+  await client.capture_exception(from_extension)
+  browser.emit('error', { message: 'Script error.', filename: 'https://widget.example.com/embed.js' })
+
+  await client.capture_exception(new Error('a real one'))
+  await client.flush()
+
+  assert.deepEqual(
+    browser.sent.map((sent) => sent.body.message),
+    ['a real one'],
+  )
+})
+
+test('events carry the browser context next to their own extra', async () => {
+  const browser = fake_browser()
+  globalThis.window.innerWidth = 390
+  globalThis.window.innerHeight = 844
+  navigator.language = 'tr-TR'
+  navigator.onLine = false
+
+  const client = new_client()
+  client.install(fake_app())
+  await client.capture_exception(new Error('layout broke'), { extra: { step: 'checkout' } })
+
+  const { extra } = browser.sent[0].body
+  assert.equal(extra.step, 'checkout')
+  assert.equal(extra.browser.viewport, '390x844')
+  assert.equal(extra.browser.language, 'tr-TR')
+  assert.equal(extra.browser.online, false)
+})
+
+test('capture_feedback ties the message to the latest event', async () => {
+  const browser = fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  const event_id = await client.capture_exception(new Error('checkout froze'))
+  const sent = await client.capture_feedback({ message: 'I clicked pay twice', email: 'jane@example.com' })
+
+  assert.equal(sent, true)
+  const feedback = browser.sent.find((request) => request.url.endsWith('/feedback'))
+  assert.equal(feedback.url, 'http://localhost:3000/ingest/v1/public-key/feedback')
+  assert.equal(feedback.body.event_id, event_id)
+  assert.equal(feedback.body.message, 'I clicked pay twice')
+  assert.equal(feedback.body.release, 'bugfree-web@test')
+
+  assert.equal(await client.capture_feedback({ message: '   ' }), false)
+})
+
+test('a page load is one session; an unhandled error crashes it once', async () => {
+  const browser = fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  client.set_user({ id: 42, email: 'jane@example.com' })
+  await client.capture_exception(new Error('handled one'))
+  browser.emit('error', { error: new Error('unhandled one') })
+  browser.emit('error', { error: new Error('unhandled two') })
+  await client.flush()
+
+  const counts = browser.sessions.map(({ total, errored, crashed }) => [total, errored, crashed])
+  assert.deepEqual(counts, [
+    [1, 0, 0], // the page load
+    [0, 0, 0], // the user becomes known
+    [0, 1, 0], // a captured error
+    [0, 0, 1], // the first unhandled error; the session was already errored
+  ])
+  assert.equal(browser.sessions[0].release, 'bugfree-web@test')
+  assert.equal(browser.sessions[0].did, '')
+  assert.equal(browser.sessions[3].did, '42')
+})
+
+test('sessions stay off without a release or when turned off', async () => {
+  const browser = fake_browser()
+  create_bugfree({ dsn: 'http://public-key@localhost:3000/ingest', resolve_source_maps: false }).install(fake_app())
+  create_bugfree({ dsn: 'http://public-key@localhost:3000/ingest', release: 'web@1', track_sessions: false }).install(fake_app())
+  assert.equal(browser.sessions.length, 0)
 })

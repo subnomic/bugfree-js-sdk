@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { create_breadcrumbs } from '../src/breadcrumbs.js'
+import { create_breadcrumbs, describe_element } from '../src/breadcrumbs.js'
 
 test('the steps are ordered newest to oldest', () => {
   const crumbs = create_breadcrumbs(10)
@@ -94,4 +94,74 @@ test('a failed fetch leaves an error step and re-throws', async () => {
   assert.match(crumb.data, /failed/)
 
   delete globalThis.window
+})
+
+test('the fetch hook skips the SDK own delivery requests', async () => {
+  globalThis.window = { fetch: async () => ({ status: 202 }) }
+
+  const crumbs = create_breadcrumbs(5, { ignore_url: 'http://localhost:3000/ingest/v1/key/store' })
+  crumbs.install_fetch_hook()
+  await globalThis.window.fetch('http://localhost:3000/ingest/v1/key/store', { method: 'POST' })
+
+  assert.equal(crumbs.list().length, 0)
+})
+
+test('the XHR hook records requests as steps', () => {
+  class FakeXHR {
+    open() {}
+    send() {
+      this.status = 503
+      this.listeners.forEach((listener) => listener())
+    }
+    addEventListener(name, listener) {
+      this.listeners = [...(this.listeners || []), listener]
+    }
+  }
+  globalThis.window = { XMLHttpRequest: FakeXHR }
+
+  const crumbs = create_breadcrumbs(5)
+  crumbs.install_xhr_hook()
+  const request = new FakeXHR()
+  request.open('post', '/api/v1/orders')
+  request.send()
+
+  const [crumb] = crumbs.list()
+  assert.equal(crumb.category, 'xhr')
+  assert.equal(crumb.message, 'POST /api/v1/orders')
+  assert.equal(crumb.level, 'warning')
+  assert.match(crumb.data, /^503/)
+})
+
+test('describe_element keeps a selector and never the text', () => {
+  const button = {
+    tagName: 'BUTTON',
+    id: 'save',
+    className: 'bf-btn bf-btn-primary',
+    textContent: 'Pay 1,250 EUR to Jane Doe',
+    getAttribute: (name) => (name === 'aria-label' ? 'Save order' : null),
+  }
+
+  assert.equal(describe_element(button), 'button#save.bf-btn.bf-btn-primary[aria-label="Save order"]')
+  assert.equal(describe_element(null), '')
+})
+
+test('the history hook records page changes', () => {
+  globalThis.location = { pathname: '/issues', search: '' }
+  globalThis.window = {
+    history: {
+      pushState(_state, _title, url) {
+        globalThis.location = { pathname: url, search: '' }
+      },
+      replaceState() {},
+    },
+    addEventListener() {},
+  }
+
+  const crumbs = create_breadcrumbs(5)
+  crumbs.install_history_hook()
+  globalThis.window.history.pushState({}, '', '/issues/BF-1')
+
+  const [crumb] = crumbs.list()
+  assert.equal(crumb.category, 'navigation')
+  assert.equal(crumb.message, '/issues → /issues/BF-1')
 })

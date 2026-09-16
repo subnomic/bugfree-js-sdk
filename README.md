@@ -22,7 +22,8 @@ export const bugfree = create_bugfree({
   release: 'web@1.4.0',
 })
 
-// window.onerror + unhandledrejection + fetch and console breadcrumbs
+// window.onerror + unhandledrejection, and breadcrumbs for fetch, XHR,
+// clicks, page changes and the console
 bugfree.install()
 ```
 
@@ -72,6 +73,29 @@ bugfree.add_breadcrumb({ category: 'ui', message: 'clicked pay' })
 await bugfree.flush()   // before navigating away
 ```
 
+Both capture calls return a promise of the event id (`null` when nothing was
+sent); `bugfree.last_event_id()` has it as soon as the call returns, to show the
+user as a reference. An error created with `{ cause }` lists its causes on the
+issue.
+
+### User feedback
+
+```js
+// A dialog that asks what happened, tied to the latest captured event
+await bugfree.show_feedback_dialog({ labels: { title: 'Sorry, that did not work' } })
+
+// Or from a form of your own
+await bugfree.capture_feedback({ message, email })
+```
+
+Every event carries the browser context under `extra.browser`: viewport and
+screen size, language, online state and connection type.
+
+Clicks are recorded by selector only (tag, id, classes, `name` or
+`aria-label`), never by the text on the page. When the page is left, events still
+waiting are handed to `sendBeacon`. A `429` answer pauses sending for as long as
+its `Retry-After` asks, a minute when it names no time.
+
 ## Original source instead of minified frames
 
 Browser stack traces point at the bundle (`/assets/index-abc.js:1:24815`).
@@ -104,6 +128,15 @@ mapping) are sent as-is — an error is never dropped because of a missing map.
 | `resolve_source_maps` | `true` | Resolve minified frames through `.map` files. |
 | `max_breadcrumbs` | `30` | Ring buffer size. |
 | `dedupe_window_ms` | `10000` | Same error is sent once per window. |
+| `ignore_errors` | `[]` | Strings or RegExps; drops errors whose `Type: message` matches. |
+| `traces_sample_rate` | `0` | Share of page loads and navigations timed, with requests as spans and web vitals. |
+| `replays_on_error_sample_rate` | `0` | Share of page loads that keep their last minute of session replay and send it with an error. |
+| `replays_session_sample_rate` | `0` | Share of page loads recorded as a session replay from start to end. |
+| `replay_mask_all_text` | `true` | Mask every text in replays (input values are always masked). |
+| `profiles_sample_rate` | `0` | Share of timed transactions profiled with the JS Self-Profiling API (Chromium, page served with `Document-Policy: js-profiling`). |
+| `trace_propagation_targets` | `[]` | Other origins whose requests carry the `traceparent` header. |
+| `track_sessions` | `true` | Report every page load as a session of the release, for release health. |
+| `deny_urls` | `[]` | Strings or RegExps; drops errors thrown by scripts at these addresses. |
 | `before_send` | `null` | Return `null` to drop, or edit the event. |
 | `debug` | `false` | Warn to the console about SDK problems. |
 
