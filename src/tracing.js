@@ -28,6 +28,17 @@ function random_hex(bytes) {
 }
 
 export const new_trace_id = () => random_hex(16)
+
+/**
+ * Decides from the trace id whether a trace is recorded at rate, as the server and
+ * the Go SDK do: the services of one trace agree without trusting each other.
+ */
+export function trace_sampled(trace_id, rate) {
+  if (rate >= 1) return true
+  if (!(rate > 0)) return false
+  const head = Number.parseInt(String(trace_id).slice(0, 8), 16)
+  return Number.isFinite(head) && head / 2 ** 32 < rate
+}
 export const new_span_id = () => random_hex(8)
 
 function now_ms() {
@@ -103,10 +114,11 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
     if (!enabled) return null
     // A new navigation ends the one before it.
     if (active) finish(active)
+    const trace_id = new_trace_id()
     const transaction = {
-      trace_id: new_trace_id(),
+      trace_id,
       span_id: new_span_id(),
-      sampled: Math.random() < sample_rate,
+      sampled: trace_sampled(trace_id, sample_rate),
       name,
       op,
       status: 'ok',

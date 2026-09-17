@@ -1,6 +1,6 @@
 {
   "name": "@subnomic/bugfree-js",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "bugfree SDK for browser applications, with Vue, React or no framework",
   "type": "module",
   "main": "src/index.js",

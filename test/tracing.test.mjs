@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict'
 import { mock, test } from 'node:test'
 
-import { create_tracer, is_propagation_target } from '../src/tracing.js'
+import { create_tracer, is_propagation_target, trace_sampled } from '../src/tracing.js'
 import { create_breadcrumbs } from '../src/breadcrumbs.js'
+
+test('trace_sampled decides by the trace id', () => {
+  assert.equal(trace_sampled('00000001aaaaaaaaaaaaaaaaaaaaaaaa', 0.01), true)
+  assert.equal(trace_sampled('ffffffffaaaaaaaaaaaaaaaaaaaaaaaa', 0.99), false)
+  assert.equal(trace_sampled('ffffffffaaaaaaaaaaaaaaaaaaaaaaaa', 1), true)
+  assert.equal(trace_sampled('00000001aaaaaaaaaaaaaaaaaaaaaaaa', 0), false)
+})
 
 test('the trace header only goes to the page own origin and the listed targets', () => {
   globalThis.location = { origin: 'https://app.example.com', pathname: '/' }
