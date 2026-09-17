@@ -27,7 +27,7 @@ import { open_feedback_dialog } from './feedback-dialog.js'
 import { create_tracer } from './tracing.js'
 import { create_recorder, create_replay_buffer } from './replay.js'
 
-export const VERSION = '0.7.0'
+export const VERSION = '0.8.0'
 
 /** Parses a DSN: http://<key>@host[/ingest] */
 export function parse_dsn(dsn) {
