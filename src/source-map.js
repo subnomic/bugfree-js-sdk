@@ -11,6 +11,8 @@
  * CSP rules are not in the way.
  */
 
+import { function_at } from './function-name.js'
+
 // The base64 alphabet; a character -> value table for the VLQ decoding.
 const base64_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const base64_values = new Map([...base64_chars].map((character, index) => [character, index]))
@@ -271,10 +273,9 @@ export async function resolve_frame(frame, context_lines = 5) {
 
   const source = map.sources[position.source_index] || ''
   const content = map.sources_content[position.source_index]
-  const name = position.name_index !== undefined ? map.names[position.name_index] : ''
 
   const resolved = {
-    function: name || frame.function,
+    function: frame.function,
     file: clean_source_path(map.source_root + source),
     line: position.line,
     column: position.column,
@@ -284,6 +285,17 @@ export async function resolve_frame(frame, context_lines = 5) {
   if (typeof content === 'string') {
     resolved.context = slice_context(content.split('\n'), position.line, context_lines)
   }
+
+  // The function is named after the one the code sits in. Without the original
+  // file, the frame that called this one can name it (resolve_frames): the token
+  // at a call site is the name of the function called there. Neither field is
+  // enumerable, so neither travels with the event.
+  const enclosing = typeof content === 'string' ? function_at(content, position.line, position.column) : null
+  if (enclosing?.found) resolved.function = enclosing.name || '<anonymous>'
+  Object.defineProperty(resolved, 'named_from_source', { value: typeof content === 'string' })
+  Object.defineProperty(resolved, 'call_name', {
+    value: position.name_index !== undefined ? map.names[position.name_index] || '' : '',
+  })
   return resolved
 }
 

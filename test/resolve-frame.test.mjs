@@ -330,3 +330,49 @@ test('an annotation far from the tail of a large file is ignored', async () => {
 
   assert.equal(fetching.requested[1], 'http://localhost:3000/assets/big.js.map')
 })
+
+/**
+ * The name in the map at the failing position is the token there ("total" in the
+ * fixture), not the function. The frame keeps its own name when the original
+ * code is top-level, and the call-site name never travels with the event.
+ */
+test('resolve_frame does not name the frame after the token on the failing line', async () => {
+  const fetching = fake_fetch({
+    'http://localhost:3000/assets/named.js': { text: 'console.log(1)\n' },
+    'http://localhost:3000/assets/named.js.map': {
+      json: { ...map, mappings: [encode_segment([0, 0, 0, 0]), encode_segment([100, 0, 3, 14, 0])].join(',') },
+    },
+  })
+
+  const resolved = await resolve_frame({
+    function: 'e',
+    file: 'http://localhost:3000/assets/named.js',
+    line: 1,
+    column: 105,
+  })
+  fetching.restore()
+
+  assert.equal(resolved.function, 'e')
+  assert.equal(resolved.call_name, 'total')
+  assert.equal(JSON.stringify(resolved).includes('call_name'), false)
+})
+
+test('resolve_frame names the frame after the enclosing function', async () => {
+  const inside = ['<script setup>', 'function recalculate(cart) {', '  const total = cart.items.length', '}', '</script>'].join('\n')
+  const fetching = fake_fetch({
+    'http://localhost:3000/assets/enclosed.js': { text: 'console.log(1)\n' },
+    'http://localhost:3000/assets/enclosed.js.map': {
+      json: { ...map, sources: ['../../src/pages/cart.vue'], sourcesContent: [inside], mappings: encode_segment([100, 0, 2, 16]) },
+    },
+  })
+
+  const resolved = await resolve_frame({
+    function: 'ye',
+    file: 'http://localhost:3000/assets/enclosed.js',
+    line: 1,
+    column: 105,
+  })
+  fetching.restore()
+
+  assert.equal(resolved.function, 'recalculate')
+})

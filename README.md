@@ -150,12 +150,12 @@ node --test test/*.test.mjs
 
 The SDK is published to `github.com/subnomic/bugfree-js-sdk`, with this
 directory as that repository's root, and to npm, by the bugfree release: one
-release on the bugfree repository's Releases page with the tag `v0.9.0` publishes
+release on the bugfree repository's Releases page with the tag `v0.9.2` publishes
 the server and both SDKs at that version. Raise `version` in `package.json` and
 `VERSION` in `src/index.js` with the others.
 
 The release workflow checks that both versions match the tag, runs the tests,
-pushes this directory to that repository as one commit, tags it there as `v0.9.0`
+pushes this directory to that repository as one commit, tags it there as `v0.9.2`
 and publishes the package to npm (under `next` for a pre-release).
 
 ## License

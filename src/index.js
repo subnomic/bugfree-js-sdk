@@ -27,7 +27,7 @@ import { open_feedback_dialog } from './feedback-dialog.js'
 import { create_tracer } from './tracing.js'
 import { create_recorder, create_replay_buffer } from './replay.js'
 
-export const VERSION = '0.9.0'
+export const VERSION = '0.9.2'
 
 /** Parses a DSN: http://<key>@host[/ingest] */
 export function parse_dsn(dsn) {
@@ -259,16 +259,26 @@ export function create_bugfree(user_options = {}) {
   async function resolve_frames(frames) {
     if (!options.resolve_source_maps) return frames
 
-    return Promise.all(
+    const resolved = await Promise.all(
       frames.map(async (frame) => {
         try {
-          const resolved = await resolve_frame(frame, options.source_context_lines)
-          return resolved ? { ...frame, ...resolved } : frame
+          return await resolve_frame(frame, options.source_context_lines)
         } catch {
-          return frame
+          return null
         }
       }),
     )
+
+    // Frames run innermost first, so the next frame is the caller. Where the
+    // original file was not available, the name at its call site names the
+    // function it called.
+    return frames.map((frame, index) => {
+      const own = resolved[index]
+      if (!own) return frame
+      const caller = resolved[index + 1]
+      if (!own.named_from_source && caller?.call_name) own.function = caller.call_name
+      return { ...frame, ...own }
+    })
   }
 
   /**
