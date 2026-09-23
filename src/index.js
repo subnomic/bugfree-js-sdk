@@ -27,7 +27,7 @@ import { open_feedback_dialog } from './feedback-dialog.js'
 import { create_tracer } from './tracing.js'
 import { create_recorder, create_replay_buffer } from './replay.js'
 
-export const VERSION = '0.9.2'
+export const VERSION = '0.9.4'
 
 /** Parses a DSN: http://<key>@host[/ingest] */
 export function parse_dsn(dsn) {
@@ -72,6 +72,9 @@ const default_options = {
   deny_urls: [],
   // Counts every page load as a session of the release, for release health.
   track_sessions: true,
+  // Sends a warning event for every Content-Security-Policy violation, one issue
+  // per directive and blocked origin. Violations are breadcrumbs either way.
+  report_csp_violations: false,
   // The share of page loads and navigations timed, between 0 and 1; 0 turns tracing off.
   traces_sample_rate: 0,
   // The share of page loads recorded from start to end as a session replay.
@@ -88,7 +91,15 @@ const default_options = {
   // strings the address starts with, or RegExps.
   trace_propagation_targets: [],
   debug: false,
+  // Rewrites every address the SDK sends (the request of an event, breadcrumbs,
+  // spans, replays, feedback) before before_send and before_send_transaction see
+  // it: one place to remove the tokens a query string or a path may hold.
+  scrub_url: null,
   before_send: null,
+  // Changes or drops each timed transaction before it is sent, as before_send does
+  // for events: span descriptions hold the addresses of the requests and resources,
+  // query string included, and before_send never sees them.
+  before_send_transaction: null,
 }
 
 /** Whether text matches one of the patterns: a substring or a RegExp. */
@@ -148,16 +159,39 @@ export function browser_runtime(user_agent = '') {
   return user_agent.slice(0, 80)
 }
 
+// What an address becomes when scrub_url fails, as the server masks a value.
+const filtered_url = '[Filtered]'
+
 export function create_bugfree(user_options = {}) {
   const options = { ...default_options, ...user_options }
   const dsn = parse_dsn(options.dsn)
   const transport = dsn ? create_transport(dsn.store_url, options.debug) : null
+
+  /**
+   * Passes an address the SDK is about to send through scrub_url.
+   *
+   * A hook that throws, or returns anything but a string, sends [Filtered]: the
+   * address may hold the very token the hook was there to remove.
+   */
+  function clean_url(url) {
+    const address = url === undefined || url === null ? '' : String(url)
+    if (typeof options.scrub_url !== 'function') return address
+    try {
+      const cleaned = options.scrub_url(address)
+      if (typeof cleaned === 'string') return cleaned
+    } catch (error) {
+      if (options.debug) console.warn('[bugfree]', 'scrub_url failed, the address is filtered', error)
+    }
+    return filtered_url
+  }
+
   const tracer = create_tracer({
     sample_rate: dsn ? options.traces_sample_rate : 0,
     propagation_targets: options.trace_propagation_targets,
+    scrub_url: clean_url,
     send: (transaction) => send_transaction(transaction),
     on_start: (transaction) => start_profile(transaction),
-    on_finish: (transaction, end) => finish_profile(transaction, end),
+    on_finish: (transaction, end, sent) => finish_profile(transaction, end, sent),
   })
 
   // The profile of the transaction running now; one at a time.
@@ -176,21 +210,27 @@ export function create_bugfree(user_options = {}) {
     }
   }
 
-  /** Stops the transaction's profile and sends it, tied to its trace. */
-  async function finish_profile(transaction, end) {
+  /**
+   * Stops the transaction's profile and sends it, tied to its trace. The profiler
+   * stops either way; a transaction that was not sent (before_send_transaction
+   * dropped it, the transport is paused) leaves its profile unsent, with nothing
+   * it could belong to.
+   */
+  async function finish_profile(transaction, end, sent = true) {
     const run = profile_run
     if (!run || run.transaction !== transaction) return
     profile_run = null
     try {
       const trace = await run.profiler.stop()
-      if (!transport || transport.paused() || !trace?.samples?.length) return
+      if (!sent || !transport || transport.paused() || !trace?.samples?.length) return
       fetch(dsn.profiles_url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           kind: 'browser',
           format: 'js-self-profile',
-          profile: trace,
+          // The resources are the addresses of the scripts that ran.
+          profile: { ...trace, resources: (trace.resources || []).map(clean_url) },
           sample_interval_ms: run.profiler.sampleInterval || 10,
           trace_id: transaction.trace_id,
           started_at: new Date(transaction.start).toISOString(),
@@ -209,6 +249,7 @@ export function create_bugfree(user_options = {}) {
     // Every delivery of the SDK goes to the same ingest address.
     ignore_url: dsn?.store_url.replace(/\/store$/, ''),
     on_request: tracer.enabled ? tracer.on_request : null,
+    scrub_url: clean_url,
   })
 
   const tags = {}
@@ -312,20 +353,32 @@ export function create_bugfree(user_options = {}) {
     })
   }
 
-  /** Reports a finished transaction, with the release and environment. */
+  /**
+   * Reports a finished transaction, with the release and environment, after
+   * before_send_transaction had its say. Returns whether it was sent.
+   *
+   * The hook runs where the transaction ends, which may be inside a router hook: an
+   * error it throws drops the transaction instead of reaching the application.
+   */
   function send_transaction(transaction) {
-    if (!transport || transport.paused()) return
-    const body = JSON.stringify({
-      transactions: [
-        {
-          ...transaction,
-          environment: options.environment,
-          release: options.release,
-          user_id: user?.id ? String(user.id) : '',
-          tags: { ...tags },
-        },
-      ],
-    })
+    if (!transport || transport.paused()) return false
+    let payload = {
+      ...transaction,
+      environment: options.environment,
+      release: options.release,
+      user_id: user?.id ? String(user.id) : '',
+      tags: { ...tags },
+    }
+    if (typeof options.before_send_transaction === 'function') {
+      try {
+        payload = options.before_send_transaction(payload)
+      } catch (error) {
+        if (options.debug) console.warn('[bugfree]', 'before_send_transaction failed, transaction dropped', error)
+        return false
+      }
+      if (!payload) return false
+    }
+    const body = JSON.stringify({ transactions: [payload] })
     fetch(dsn.transactions_url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -335,6 +388,7 @@ export function create_bugfree(user_options = {}) {
     }).catch((error) => {
       if (options.debug) console.warn('[bugfree]', 'transaction could not be sent', error)
     })
+    return true
   }
 
   // How often a recording in session mode sends what it has (ms), the most events
@@ -369,6 +423,7 @@ export function create_bugfree(user_options = {}) {
     }
     state.recorder = create_recorder({
       mask_all_text: options.replay_mask_all_text,
+      scrub_url: clean_url,
       on_event: (event) => {
         if (state.mode === 'buffer') state.buffer.push(event)
         else {
@@ -424,7 +479,7 @@ export function create_bugfree(user_options = {}) {
       events,
       error_ids: replay.error_ids,
       started_at: new Date(replay.started).toISOString(),
-      url: typeof location !== 'undefined' ? location.href : '',
+      url: clean_url(typeof location !== 'undefined' ? location.href : ''),
       environment: options.environment,
       release: options.release,
       user_id: user?.id ? String(user.id) : '',
@@ -512,7 +567,7 @@ export function create_bugfree(user_options = {}) {
       extra,
       request: {
         method: 'GET',
-        url: location.pathname + location.search,
+        url: clean_url(location.pathname + location.search),
         user_agent: navigator.userAgent,
       },
       occurred_at: new Date().toISOString(),
@@ -541,6 +596,62 @@ export function create_bugfree(user_options = {}) {
       runtime: browser_runtime(navigator.userAgent),
       breadcrumbs: breadcrumbs.list(),
       tags: { sdk: `bugfree-js/${VERSION}`, ...tags, ...(context.tags || {}) },
+      occurred_at: new Date().toISOString(),
+    })
+  }
+
+  /**
+   * Records a Content-Security-Policy violation: a breadcrumb always, and a warning
+   * event with report_csp_violations. A blocked request leaves no trace on any
+   * server; without this it is found only in the browser's console.
+   */
+  function note_csp_violation(violation) {
+    if (from_extension(violation.sourceFile) || from_extension(violation.blockedURI)) return
+    const directive = csp_directive(violation)
+    const source = violation.sourceFile ? `${clean_url(violation.sourceFile)}:${violation.lineNumber || 0}` : ''
+    breadcrumbs.add({ category: 'csp', message: `${directive} blocked ${clean_url(violation.blockedURI)}`, data: source, level: 'warning' })
+    if (options.report_csp_violations) track(do_capture_csp(violation, directive))
+  }
+
+  /**
+   * Sends a violation as an event. Its type, culprit and message are the ones the
+   * server's csp endpoint writes, so both land in one issue per directive and
+   * blocked origin; a repeat inside the dedupe window is sent once.
+   */
+  async function do_capture_csp(violation, directive) {
+    if (!enabled()) return null
+    const origin = clean_url(blocked_origin(violation.blockedURI))
+    if (is_duplicate(`csp|${directive}|${origin}`)) return null
+    const disposition = violation.disposition || 'enforce'
+    return send({
+      event_id: new_event_id(),
+      level: 'warning',
+      type: 'CSPViolation',
+      message: `${directive} blocked ${origin}`,
+      culprit: directive,
+      platform: 'javascript',
+      environment: options.environment,
+      release: options.release,
+      runtime: browser_runtime(navigator.userAgent),
+      breadcrumbs: breadcrumbs.list(),
+      tags: { sdk: `bugfree-js/${VERSION}`, ...tags, 'csp.directive': directive, 'csp.disposition': disposition },
+      extra: {
+        browser: browser_context(),
+        csp: {
+          directive,
+          blocked_url: clean_url(violation.blockedURI),
+          source_file: clean_url(violation.sourceFile),
+          line: violation.lineNumber || 0,
+          column: violation.columnNumber || 0,
+          disposition,
+          sample: violation.sample || '',
+        },
+      },
+      request: {
+        method: 'GET',
+        url: clean_url(location.pathname + location.search),
+        user_agent: navigator.userAgent,
+      },
       occurred_at: new Date().toISOString(),
     })
   }
@@ -618,12 +729,12 @@ export function create_bugfree(user_options = {}) {
     }
 
     // The page load is timed from the navigation start; a router names it after
-    // the route pattern once it resolved.
-    tracer.start_page_load(typeof location !== 'undefined' ? location.pathname : '/')
+    // the route pattern once it resolved. Until then it is named after the address.
+    tracer.start_page_load(clean_url(typeof location !== 'undefined' ? location.pathname : '/'))
     if (router) {
       let first = true
       router.afterEach((to) => {
-        const route = to.matched?.[to.matched.length - 1]?.path || to.path
+        const route = to.matched?.[to.matched.length - 1]?.path || clean_url(to.path)
         if (first) tracer.rename(route)
         else tracer.start_navigation(route)
         first = false
@@ -634,7 +745,7 @@ export function create_bugfree(user_options = {}) {
       router.afterEach((to, from) => {
         breadcrumbs.add({
           category: 'navigation',
-          message: `${from.fullPath} → ${to.fullPath}`,
+          message: `${clean_url(from.fullPath)} → ${clean_url(to.fullPath)}`,
           level: 'info',
         })
       })
@@ -645,7 +756,11 @@ export function create_bugfree(user_options = {}) {
 
     breadcrumbs.install_fetch_hook()
     breadcrumbs.install_xhr_hook()
+    breadcrumbs.install_websocket_hook()
     breadcrumbs.install_click_hook()
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('securitypolicyviolation', note_csp_violation)
+    }
     start_session()
     breadcrumbs.install_console_hook()
 
@@ -653,9 +768,17 @@ export function create_bugfree(user_options = {}) {
     // events to sendBeacon before the page and its queue are gone. pagehide also
     // fires when the page enters the back/forward cache, where unload does not.
     window.addEventListener('pagehide', () => {
+      tracer.report_interactions()
       transport.beacon_queued()
       flush_replay({ leaving: true })
     })
+    // A phone rarely fires pagehide: the page is hidden and then discarded. The
+    // route's INP so far goes out when it is hidden.
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') tracer.report_interactions()
+      })
+    }
     start_replay()
   }
 
@@ -687,7 +810,7 @@ export function create_bugfree(user_options = {}) {
       message: String(message),
       name,
       email,
-      url: url ?? (typeof location !== 'undefined' ? location.href : ''),
+      url: clean_url(url ?? (typeof location !== 'undefined' ? location.href : '')),
       environment: options.environment,
       release: options.release,
     }
@@ -745,8 +868,10 @@ export function create_bugfree(user_options = {}) {
     show_feedback_dialog,
     capture_message,
     add_breadcrumb: breadcrumbs.add,
+    // A tag set to null or undefined is removed, such as the tenant after signing out.
     set_tag: (key, value) => {
-      tags[key] = value
+      if (value === null || value === undefined) delete tags[key]
+      else tags[key] = value
     },
     set_user: (value) => {
       user = value
@@ -760,6 +885,35 @@ export function create_bugfree(user_options = {}) {
     enabled,
     last_event_id: () => last_event_id,
   }
+}
+
+/** The name of the directive a violation broke; older browsers send its value too. */
+function csp_directive(violation) {
+  const directive = violation.effectiveDirective || String(violation.violatedDirective || '').trim().split(/\s+/)[0]
+  return directive ? directive.toLowerCase() : 'unknown'
+}
+
+/**
+ * Reduces what a policy blocked to what the policy names: the origin of an
+ * address, the scheme of data: or blob:, or the keyword a browser reports for
+ * code written into the page. The server groups its reports the same way.
+ */
+export function blocked_origin(blocked) {
+  const text = String(blocked || '').trim()
+  if (!text) return 'unknown'
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(text)
+  if (!scheme) return text
+  const host = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(text)
+  return host && host[1] ? `${scheme[1].toLowerCase()}://${host[1]}` : scheme[1].toLowerCase()
+}
+
+// Browser extensions break a page's policy on every visit; their violations say
+// nothing about the application.
+const extension_schemes = ['chrome-extension:', 'moz-extension:', 'safari-extension:', 'safari-web-extension:', 'ms-browser-extension:']
+
+function from_extension(address) {
+  const text = String(address || '').trim().toLowerCase()
+  return extension_schemes.some((scheme) => text.startsWith(scheme))
 }
 
 // The deepest `cause` chain an event lists.

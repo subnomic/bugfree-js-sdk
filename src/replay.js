@@ -15,6 +15,8 @@
 const skipped_tags = new Set(['SCRIPT', 'NOSCRIPT', 'TEMPLATE'])
 // Attributes that load media; dropped so a replay shows placeholders.
 const media_attributes = new Set(['src', 'srcset', 'poster'])
+// Attributes holding an address, recorded after scrub_url.
+const url_attributes = new Set(['href', 'action'])
 // How often pointer moves are sampled (ms).
 const mouse_interval = 50
 // A recording that changes faster than this is paused: a page animating its whole
@@ -28,8 +30,10 @@ export function mask_text(text) {
 
 /**
  * @param {{ mask_all_text?: boolean, on_event: (event: object) => void, now?: () => number }} options
+ *
+ * scrub_url rewrites the page's address and the links and form targets recorded.
  */
-export function create_recorder({ mask_all_text = true, on_event, now = () => Date.now() }) {
+export function create_recorder({ mask_all_text = true, on_event, now = () => Date.now(), scrub_url = (url) => url }) {
   const ids = new WeakMap()
   let next_id = 1
   let observer = null
@@ -77,10 +81,10 @@ export function create_recorder({ mask_all_text = true, on_event, now = () => Da
           const name = attribute.name.toLowerCase()
           if (name.startsWith('on')) continue
           if (media_attributes.has(name) && node.nodeName !== 'LINK') continue
-          attributes[name] = attribute.value
+          attributes[name] = url_attributes.has(name) ? scrub_url(attribute.value) : attribute.value
         }
         // Stylesheets are loaded by the player from their absolute address.
-        if (node.nodeName === 'LINK' && node.href) attributes.href = node.href
+        if (node.nodeName === 'LINK' && node.href) attributes.href = scrub_url(node.href)
         if ('value' in node && ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.nodeName)) {
           attributes.value = node.type === 'checkbox' || node.type === 'radio' ? '' : mask_text(String(node.value || ''))
           if (node.checked) attributes.checked = ''
@@ -106,7 +110,7 @@ export function create_recorder({ mask_all_text = true, on_event, now = () => Da
       height: window.innerHeight,
       scroll_x: window.scrollX || 0,
       scroll_y: window.scrollY || 0,
-      url: location.href,
+      url: scrub_url(location.href),
     })
   }
 
@@ -126,7 +130,8 @@ export function create_recorder({ mask_all_text = true, on_event, now = () => Da
       } else if (record.type === 'attributes' && ids.has(record.target)) {
         const name = record.attributeName.toLowerCase()
         if (name.startsWith('on') || media_attributes.has(name)) continue
-        emit({ type: 'attribute', id: ids.get(record.target), name, value: record.target.getAttribute(record.attributeName) })
+        const value = record.target.getAttribute(record.attributeName)
+        emit({ type: 'attribute', id: ids.get(record.target), name, value: url_attributes.has(name) && value !== null ? scrub_url(value) : value })
       } else if (record.type === 'characterData' && ids.has(record.target)) {
         const text = record.target.textContent || ''
         emit({ type: 'text', id: ids.get(record.target), text: mask_all_text && !in_style(record.target) ? mask_text(text) : text })

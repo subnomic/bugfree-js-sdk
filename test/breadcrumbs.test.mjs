@@ -165,3 +165,70 @@ test('the history hook records page changes', () => {
   assert.equal(crumb.category, 'navigation')
   assert.equal(crumb.message, '/issues → /issues/BF-1')
 })
+
+/** A WebSocket that opens and closes when the test says so. */
+class FakeWebSocket {
+  static OPEN = 1
+  constructor(url, protocols) {
+    this.url = String(url)
+    this.protocols = protocols
+    this.listeners = {}
+    this.sent = []
+  }
+  addEventListener(name, handler) {
+    this.listeners[name] = [...(this.listeners[name] || []), handler]
+  }
+  send(data) {
+    this.sent.push(data)
+  }
+  emit(name, event = {}) {
+    for (const handler of this.listeners[name] || []) handler(event)
+  }
+}
+
+test('the WebSocket hook records connections, never their messages', () => {
+  globalThis.window = { WebSocket: FakeWebSocket }
+  const crumbs = create_breadcrumbs(10, { scrub_url: (url) => url.replace(/ticket=[^&]+/, 'ticket=:ticket') })
+  crumbs.install_websocket_hook()
+
+  const socket = new window.WebSocket('wss://app.example.com/terminal?ticket=secret', ['v1'])
+  assert.ok(socket instanceof FakeWebSocket, 'the socket is still a WebSocket')
+  assert.equal(window.WebSocket.OPEN, 1, 'the constants are still there')
+  assert.deepEqual(socket.protocols, ['v1'])
+
+  socket.emit('open')
+  socket.send('ls -la')
+  socket.emit('message', { data: 'total 0' })
+  socket.emit('error')
+  socket.emit('close', { code: 1006, reason: '', wasClean: false })
+
+  const list = crumbs.list().reverse()
+  assert.deepEqual(
+    list.map((crumb) => [crumb.category, crumb.message, crumb.level]),
+    [
+      ['websocket', 'open wss://app.example.com/terminal?ticket=:ticket', 'info'],
+      ['websocket', 'error wss://app.example.com/terminal?ticket=:ticket', 'error'],
+      ['websocket', 'close wss://app.example.com/terminal?ticket=:ticket', 'warning'],
+    ],
+  )
+  assert.match(list[2].data, /^1006 · not clean · \d+ms$/)
+  assert.deepEqual(socket.sent, ['ls -la'])
+  const recorded = JSON.stringify(list)
+  assert.ok(!recorded.includes('ls -la') && !recorded.includes('total 0'), 'a message was recorded')
+  assert.ok(!recorded.includes('secret'))
+})
+
+test('the WebSocket hook wraps a page once', () => {
+  globalThis.window = { WebSocket: FakeWebSocket }
+  const first = create_breadcrumbs(10)
+  const second = create_breadcrumbs(10)
+  first.install_websocket_hook()
+  const wrapped = window.WebSocket
+  second.install_websocket_hook()
+  assert.equal(window.WebSocket, wrapped)
+
+  const socket = new window.WebSocket('wss://app.example.com/chat')
+  socket.emit('close', { code: 1000, reason: 'bye', wasClean: true })
+  assert.equal(first.list()[0].data.startsWith('1000 bye · clean'), true)
+  assert.equal(second.list().length, 0)
+})

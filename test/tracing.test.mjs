@@ -120,3 +120,71 @@ test('the fetch hook adds the trace header and ends the span', async () => {
   assert.deepEqual(seen, ['00-abc-def-01'])
   assert.deepEqual(finished, [200])
 })
+
+/** A PerformanceObserver whose event entries the test hands in. */
+function fake_event_timing() {
+  const observers = []
+  globalThis.PerformanceObserver = class {
+    constructor(callback) {
+      this.callback = callback
+    }
+    observe(options) {
+      if (options.type === 'event') observers.push(this)
+    }
+  }
+  return (...entries) => observers.forEach((observer) => observer.callback({ getEntries: () => entries }))
+}
+
+test('a route reports its INP when it is left, in its own trace', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  const deliver = fake_event_timing()
+  try {
+    const sent = []
+    const tracer = create_tracer({ sample_rate: 1, send: (transaction) => sent.push(transaction) })
+    const editor = tracer.start_navigation('/editor/:id')
+    mock.timers.tick(1000)
+
+    deliver(
+      { interactionId: 7, duration: 80, startTime: 1200 },
+      // The same interaction's slowest event counts.
+      { interactionId: 7, duration: 120, startTime: 1200 },
+      { interactionId: 9, duration: 344, startTime: 2400 },
+      // A scroll is not an interaction.
+      { interactionId: 0, duration: 900, startTime: 2600 },
+    )
+    tracer.start_navigation('/settings')
+
+    const report = sent.find((transaction) => transaction.op === 'ui.interaction')
+    assert.equal(report.name, '/editor/:id')
+    assert.equal(report.trace_id, editor.trace_id)
+    assert.equal(report.parent_span_id, editor.span_id)
+    assert.equal(report.duration_ms, 344)
+    assert.deepEqual(report.measurements, { inp: 344 })
+
+    // Nothing slow on the next route: nothing to report when the page is hidden.
+    const before = sent.length
+    tracer.report_interactions()
+    assert.equal(sent.length, before)
+  } finally {
+    mock.timers.reset()
+    delete globalThis.PerformanceObserver
+  }
+})
+
+test('INP skips one interaction for every fifty on a busy route', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  const deliver = fake_event_timing()
+  try {
+    const sent = []
+    const tracer = create_tracer({ sample_rate: 1, send: (transaction) => sent.push(transaction) })
+    tracer.start_navigation('/terminal')
+    deliver(...Array.from({ length: 60 }, (_, index) => ({ interactionId: index + 1, duration: 41 + index, startTime: index })))
+    tracer.report_interactions()
+
+    const report = sent.find((transaction) => transaction.op === 'ui.interaction')
+    assert.equal(report.measurements.inp, 99, 'the slowest of sixty (100) is skipped')
+  } finally {
+    mock.timers.reset()
+    delete globalThis.PerformanceObserver
+  }
+})

@@ -4,8 +4,10 @@
  * The steps tell how the error came about: which page was visited, which request
  * was made, what was written to the console. A ring buffer is used; past the
  * limit the oldest step is dropped.
+ *
+ * scrub_url rewrites the addresses of requests and pages as they are recorded.
  */
-export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = null } = {}) {
+export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = null, scrub_url = (url) => url } = {}) {
   const items = []
 
   /** The SDK's own delivery requests are not steps of the application. */
@@ -56,7 +58,7 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
         tracking?.finish(response.status)
         add({
           category: 'fetch',
-          message: `${method} ${url}`,
+          message: `${method} ${scrub_url(url)}`,
           data: `${response.status} · ${Date.now() - started}ms`,
           level: response.status >= 400 ? 'warning' : 'info',
         })
@@ -65,7 +67,7 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
         tracking?.finish(0)
         add({
           category: 'fetch',
-          message: `${method} ${url}`,
+          message: `${method} ${scrub_url(url)}`,
           data: `failed · ${error.message}`,
           level: 'error',
         })
@@ -125,7 +127,7 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
           const failed = this.status === 0
           add({
             category: 'xhr',
-            message: `${request.method} ${request.url}`,
+            message: `${request.method} ${scrub_url(request.url)}`,
             data: failed ? 'failed' : `${this.status} · ${Date.now() - started}ms`,
             level: failed ? 'error' : this.status >= 400 ? 'warning' : 'info',
           })
@@ -136,6 +138,40 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
     open.__bugfree = true
     XHR.prototype.open = open
     XHR.prototype.send = send
+  }
+
+  /**
+   * Records WebSocket connections as steps: opened, failed and closed, with the
+   * close code, the reason and whether it closed cleanly. A terminal, a console or
+   * a chat that stops updating left no trace before the error it caused.
+   *
+   * Messages are never recorded, sent or received: they are the application's data.
+   */
+  function install_websocket_hook() {
+    const Native = typeof window === 'undefined' ? undefined : window.WebSocket
+    if (typeof Native !== 'function' || Native.__bugfree) return
+
+    // A subclass keeps instanceof, the static constants and every method as they are.
+    class BugfreeWebSocket extends Native {
+      constructor(url, protocols) {
+        super(url, protocols)
+        const address = scrub_url(String(url))
+        const opened = Date.now()
+        this.addEventListener('open', () => add({ category: 'websocket', message: `open ${address}` }))
+        this.addEventListener('error', () => add({ category: 'websocket', message: `error ${address}`, level: 'error' }))
+        this.addEventListener('close', (event) => {
+          const reason = event.reason ? ` ${event.reason}` : ''
+          add({
+            category: 'websocket',
+            message: `close ${address}`,
+            data: `${event.code}${reason} · ${event.wasClean ? 'clean' : 'not clean'} · ${Date.now() - opened}ms`,
+            level: event.wasClean ? 'info' : 'warning',
+          })
+        })
+      }
+    }
+    BugfreeWebSocket.__bugfree = true
+    window.WebSocket = BugfreeWebSocket
   }
 
   /**
@@ -170,7 +206,7 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
     const record = () => {
       const next = current_path()
       if (next === last) return
-      add({ category: 'navigation', message: `${last} → ${next}` })
+      add({ category: 'navigation', message: `${scrub_url(last)} → ${scrub_url(next)}` })
       last = next
     }
 
@@ -193,6 +229,7 @@ export function create_breadcrumbs(limit = 30, { ignore_url = '', on_request = n
     list,
     install_fetch_hook,
     install_xhr_hook,
+    install_websocket_hook,
     install_console_hook,
     install_click_hook,
     install_history_hook,

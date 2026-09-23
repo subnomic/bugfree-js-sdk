@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { browser_runtime, create_bugfree, error_chain } from '../src/index.js'
+import { blocked_origin, browser_runtime, create_bugfree, error_chain } from '../src/index.js'
 
 /**
  * Verifies that the handlers install() sets up really produce events.
@@ -363,4 +363,300 @@ test('sessions stay off without a release or when turned off', async () => {
   create_bugfree({ dsn: 'http://public-key@localhost:3000/ingest', resolve_source_maps: false }).install(fake_app())
   create_bugfree({ dsn: 'http://public-key@localhost:3000/ingest', release: 'web@1', track_sessions: false }).install(fake_app())
   assert.equal(browser.sessions.length, 0)
+})
+
+test('before_send_transaction scrubs or drops a transaction before it is sent', async () => {
+  const browser = fake_browser()
+  const seen = []
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    release: 'bugfree-web@test',
+    resolve_source_maps: false,
+    track_sessions: false,
+    traces_sample_rate: 1,
+    before_send_transaction(transaction) {
+      seen.push(transaction.name)
+      if (transaction.name === 'dropped') return null
+      if (transaction.name === 'broken') throw new Error('a hook that fails')
+      for (const span of transaction.spans) span.description = span.description.replace(/\?\S*/, '')
+      return transaction
+    },
+  })
+  client.install(fake_app())
+  client.set_user({ id: 7 })
+
+  // The page load install() started ends with the first action.
+  const save = client.start_transaction('save settings')
+  await window.fetch('/api/v1/settings?token=secret')
+  save.finish()
+  client.start_transaction('dropped').finish()
+  // A hook that throws loses its transaction, never the caller's flow.
+  assert.doesNotThrow(() => client.start_transaction('broken').finish())
+
+  assert.deepEqual(seen, ['/debug', 'save settings', 'dropped', 'broken'])
+  const transactions = browser.sent
+    .filter(({ url }) => url.endsWith('/transactions'))
+    .map(({ body }) => body.transactions[0])
+  assert.deepEqual(
+    transactions.map((transaction) => transaction.name),
+    ['/debug', 'save settings'],
+  )
+  const [, sent] = transactions
+  assert.equal(sent.spans[0].description, 'GET /api/v1/settings')
+  // The hook sees the transaction as it is sent, release and user included.
+  assert.equal(sent.release, 'bugfree-web@test')
+  assert.equal(sent.user_id, '7')
+  assert.ok(!JSON.stringify(browser.sent).includes('secret'))
+})
+
+/** The smallest DOM the replay recorder can take a snapshot of. */
+function fake_document() {
+  const element = (name, attributes = {}, extra = {}) => ({
+    nodeType: 1,
+    nodeName: name,
+    attributes: Object.entries(attributes).map(([attribute, value]) => ({ name: attribute, value })),
+    childNodes: [],
+    ...extra,
+  })
+  const root = element('HTML')
+  root.childNodes = [
+    element('LINK', { rel: 'stylesheet' }, { href: 'http://localhost:3000/app.css?token=secret-7' }),
+    element('A', { href: '/invite/secret-8' }),
+    element('FORM', { action: '/reset-password/secret-9' }),
+  ]
+  globalThis.document = { documentElement: root, addEventListener: () => {}, removeEventListener: () => {} }
+  globalThis.window.removeEventListener = () => {}
+  globalThis.MutationObserver = class {
+    observe() {}
+    disconnect() {}
+  }
+}
+
+test('scrub_url rewrites every address the SDK sends', async () => {
+  const browser = fake_browser()
+  globalThis.location = {
+    pathname: '/reset-password/secret-1',
+    search: '?token=secret-2',
+    href: 'http://localhost:3000/reset-password/secret-1?token=secret-2',
+    origin: 'http://localhost:3000',
+  }
+  fake_document()
+  const scrubbed = []
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    release: 'bugfree-web@test',
+    resolve_source_maps: false,
+    track_sessions: false,
+    traces_sample_rate: 1,
+    replays_session_sample_rate: 1,
+    scrub_url(url) {
+      scrubbed.push(url)
+      return url.replace(/secret-\d+/g, ':token')
+    },
+    // before_send and before_send_transaction see the addresses already rewritten.
+    before_send(event) {
+      assert.ok(!JSON.stringify(event).includes('secret'), 'before_send saw a raw address')
+      return event
+    },
+    before_send_transaction(transaction) {
+      assert.ok(!JSON.stringify(transaction).includes('secret'), 'before_send_transaction saw a raw address')
+      return transaction
+    },
+  })
+  const after_each = []
+  client.install(fake_app(), { afterEach: (hook) => after_each.push(hook) })
+  after_each.forEach((hook) => hook({ matched: [], path: '/invite/secret-3', fullPath: '/invite/secret-3' }, { fullPath: '/' }))
+
+  const save = client.start_transaction('accept invitation')
+  await window.fetch('/api/v1/invites/secret-4/accept?token=secret-5')
+  save.finish()
+  await client.capture_exception(new Error('the invitation could not be accepted'))
+  await client.capture_feedback({ message: 'the link did not work' })
+  client.stop_replay()
+  await client.flush()
+
+  const bodies = browser.sent.map(({ body }) => JSON.stringify(body)).join('\n')
+  assert.ok(!bodies.includes('secret'), 'a raw address left the browser')
+  const find = (suffix) => browser.sent.find(({ url }) => url.endsWith(suffix))?.body
+
+  const event = find('/store')
+  assert.equal(event.request.url, '/reset-password/:token?token=:token')
+  assert.deepEqual(
+    event.breadcrumbs.map((crumb) => crumb.message),
+    ['GET /api/v1/invites/:token/accept?token=:token', '/ → /invite/:token'],
+  )
+
+  const [page_load, action] = browser.sent.filter(({ url }) => url.endsWith('/transactions')).map(({ body }) => body.transactions[0])
+  // The router named the page load after an address, not a route pattern.
+  assert.equal(page_load.name, '/invite/:token')
+  assert.equal(action.spans[0].description, 'GET /api/v1/invites/:token/accept?token=:token')
+
+  const segment = find('/segments')
+  assert.equal(segment.url, 'http://localhost:3000/reset-password/:token?token=:token')
+  const snapshot = segment.events.find((recorded) => recorded.type === 'snapshot')
+  assert.equal(snapshot.url, 'http://localhost:3000/reset-password/:token?token=:token')
+  assert.deepEqual(
+    snapshot.node.children.map((child) => child.attributes.href || child.attributes.action),
+    ['http://localhost:3000/app.css?token=:token', '/invite/:token', '/reset-password/:token'],
+  )
+
+  assert.equal(find('/feedback').url, 'http://localhost:3000/reset-password/:token?token=:token')
+  assert.ok(scrubbed.length > 0)
+
+  delete globalThis.document
+  delete globalThis.MutationObserver
+})
+
+test('a scrub_url that fails sends [Filtered] instead of the address', async () => {
+  const browser = fake_browser()
+  globalThis.location = { pathname: '/invite/secret-1', search: '', href: 'http://localhost:3000/invite/secret-1', origin: 'http://localhost:3000' }
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    resolve_source_maps: false,
+    scrub_url: (url) => {
+      if (url.startsWith('http')) throw new Error('a hook that fails')
+      return undefined
+    },
+  })
+  client.install(fake_app())
+
+  await client.capture_exception(new Error('boom'))
+  await client.capture_feedback({ message: 'broken' })
+  await client.flush()
+
+  assert.equal(browser.sent.find(({ url }) => url.endsWith('/store')).body.request.url, '[Filtered]')
+  assert.equal(browser.sent.find(({ url }) => url.endsWith('/feedback')).body.url, '[Filtered]')
+  assert.ok(!JSON.stringify(browser.sent).includes('secret'))
+})
+
+/** A document that keeps its listeners, so a test can fire the page's events. */
+function listening_document() {
+  const listeners = {}
+  globalThis.document = {
+    addEventListener: (name, handler) => {
+      listeners[name] = [...(listeners[name] || []), handler]
+    },
+    removeEventListener: () => {},
+  }
+  return (name, event) => (listeners[name] || []).forEach((handler) => handler(event))
+}
+
+test('a CSP violation is a breadcrumb, and an event with report_csp_violations', async () => {
+  const browser = fake_browser()
+  const fire = listening_document()
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    resolve_source_maps: false,
+    report_csp_violations: true,
+    scrub_url: (url) => url.replace(/sig=[^&]+/, 'sig=:signature'),
+  })
+  client.install(fake_app())
+
+  const violation = {
+    effectiveDirective: 'img-src',
+    blockedURI: 'https://cdn.example.com/previews/7.png?sig=secret',
+    sourceFile: 'http://localhost:3000/assets/index.js',
+    lineNumber: 12,
+    disposition: 'enforce',
+  }
+  fire('securitypolicyviolation', violation)
+  // The same directive and origin again is a repeat; another image of the host too.
+  fire('securitypolicyviolation', { ...violation, blockedURI: 'https://cdn.example.com/previews/8.png' })
+  // A browser extension's violation is not the application's.
+  fire('securitypolicyviolation', { effectiveDirective: 'style-src', blockedURI: 'chrome-extension://abc/inject.css' })
+  await client.capture_exception(new Error('the preview did not load'))
+  await client.flush()
+
+  const events = browser.sent.map(({ body }) => body)
+  const csp = events.filter((event) => event.type === 'CSPViolation')
+  assert.equal(csp.length, 1)
+  assert.equal(csp[0].level, 'warning')
+  assert.equal(csp[0].message, 'img-src blocked https://cdn.example.com')
+  assert.equal(csp[0].culprit, 'img-src')
+  assert.equal(csp[0].extra.csp.blocked_url, 'https://cdn.example.com/previews/7.png?sig=:signature')
+
+  const error = events.find((event) => event.type === 'Error')
+  const crumbs = error.breadcrumbs.filter((crumb) => crumb.category === 'csp')
+  assert.deepEqual(
+    crumbs.map((crumb) => [crumb.message, crumb.data, crumb.level]),
+    [
+      ['img-src blocked https://cdn.example.com/previews/8.png', 'http://localhost:3000/assets/index.js:12', 'warning'],
+      ['img-src blocked https://cdn.example.com/previews/7.png?sig=:signature', 'http://localhost:3000/assets/index.js:12', 'warning'],
+    ],
+  )
+  assert.ok(!JSON.stringify(browser.sent).includes('secret'))
+  delete globalThis.document
+})
+
+test('CSP violations send no event unless report_csp_violations is on', async () => {
+  const browser = fake_browser()
+  const fire = listening_document()
+  const client = new_client()
+  client.install(fake_app())
+
+  fire('securitypolicyviolation', { violatedDirective: "connect-src 'self'", blockedURI: 'https://ingest.example.com/store' })
+  await client.flush()
+
+  assert.equal(browser.sent.length, 0)
+  delete globalThis.document
+})
+
+test('blocked_origin groups what a policy blocked as the server does', () => {
+  assert.equal(blocked_origin('https://cdn.example.com:8443/a.png?x=1'), 'https://cdn.example.com:8443')
+  assert.equal(blocked_origin('data:image/png;base64,AAAA'), 'data')
+  assert.equal(blocked_origin('blob:https://app.example.com/1234'), 'blob')
+  assert.equal(blocked_origin('inline'), 'inline')
+  assert.equal(blocked_origin(''), 'unknown')
+})
+
+test('set_tag with null or undefined removes the tag', async () => {
+  const browser = fake_browser()
+  const client = new_client()
+  client.install(fake_app())
+
+  client.set_tag('tenant_id', 't-1')
+  client.set_tag('plan', 'team')
+  await client.capture_message('signed in')
+  client.set_tag('tenant_id', null)
+  client.set_tag('plan', undefined)
+  await client.capture_message('signed out')
+  await client.flush()
+
+  const [signed_in, signed_out] = browser.sent.map(({ body }) => body.tags)
+  assert.equal(signed_in.tenant_id, 't-1')
+  assert.equal(signed_in.plan, 'team')
+  assert.ok(!('tenant_id' in signed_out) && !('plan' in signed_out), JSON.stringify(signed_out))
+  assert.ok(signed_out.sdk, 'the SDK tag stays')
+})
+
+test('a transaction before_send_transaction drops sends no profile', async () => {
+  const browser = fake_browser()
+  const stopped = []
+  window.Profiler = class {
+    sampleInterval = 10
+    async stop() {
+      stopped.push(true)
+      return { frames: [], resources: [], stacks: [], samples: [{ timestamp: 1 }] }
+    }
+  }
+  const client = create_bugfree({
+    dsn: 'http://public-key@localhost:3000/ingest',
+    resolve_source_maps: false,
+    track_sessions: false,
+    traces_sample_rate: 1,
+    profiles_sample_rate: 1,
+    before_send_transaction: (transaction) => (transaction.name === 'kept' ? transaction : null),
+  })
+  client.install(fake_app())
+
+  // The page load install() started ends with the first action, and is dropped.
+  client.start_transaction('dropped').finish()
+  client.start_transaction('kept').finish()
+  await new Promise((resolve) => setTimeout(resolve, 10))
+
+  assert.equal(stopped.length, 3, 'every profiler is stopped')
+  const profiles = browser.sent.filter(({ url }) => url.endsWith('/profiles'))
+  assert.equal(profiles.length, 1, 'only the kept transaction sends its profile')
+  const [kept] = browser.sent.filter(({ url }) => url.endsWith('/transactions')).map(({ body }) => body.transactions[0])
+  assert.equal(profiles[0].body.trace_id, kept.trace_id)
 })

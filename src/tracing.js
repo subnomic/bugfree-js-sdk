@@ -16,6 +16,14 @@ const max_transaction_ms = 30_000
 const max_spans = 500
 // The most resources of a page load recorded as spans.
 const max_resources = 100
+// Interactions faster than this are not recorded for INP (ms): the slowest one of
+// a route is what counts, and the browser reports the rest only on request.
+const interaction_threshold_ms = 40
+// The most interactions of one route kept for INP.
+const max_interactions = 500
+// The op of the transaction that reports a route's INP. Its duration is one
+// interaction's, so the server leaves it out of the latency figures.
+export const interaction_op = 'ui.interaction'
 
 function random_hex(bytes) {
   const values = new Uint8Array(bytes)
@@ -65,10 +73,28 @@ export function is_propagation_target(url, targets = []) {
 
 /**
  * @param {{ sample_rate: number, propagation_targets: Array<string|RegExp>, send: (transaction: object) => void }} config
+ *
+ * scrub_url rewrites the addresses the spans describe; the trace header is still
+ * decided on the address as requested.
  */
-export function create_tracer({ sample_rate = 0, propagation_targets = [], send, on_start = null, on_finish = null }) {
+export function create_tracer({
+  sample_rate = 0,
+  propagation_targets = [],
+  send,
+  on_start = null,
+  on_finish = null,
+  scrub_url = (url) => url,
+}) {
   let active = null
   const enabled = sample_rate > 0
+
+  // The page load or navigation timing the route the page shows, and the
+  // interactions on that route by their id, each with its longest event. The page
+  // load ends once the page is idle, long before most clicks and keystrokes, so
+  // INP is reported for the route when it is left or the page is hidden.
+  let route = null
+  const interactions = new Map()
+  let observing_interactions = false
 
   function finish(transaction, end = now_ms()) {
     if (!transaction || transaction.finished) return
@@ -77,10 +103,9 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
     clearTimeout(transaction.max_timer)
     if (active === transaction) active = null
     if (!transaction.sampled) return
-    on_finish?.(transaction, end)
 
-    if (transaction.op === 'pageload') add_page_load_details(transaction)
-    send({
+    if (transaction.op === 'pageload') add_page_load_details(transaction, scrub_url)
+    const sent = send({
       trace_id: transaction.trace_id,
       span_id: transaction.span_id,
       name: transaction.name,
@@ -101,6 +126,8 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
         data: span.data,
       })),
     })
+    // After the send, which may drop the transaction: its profile goes only with it.
+    on_finish?.(transaction, end, sent !== false)
   }
 
   /** Ends the transaction once nothing is in flight for idle_ms. */
@@ -114,6 +141,8 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
     if (!enabled) return null
     // A new navigation ends the one before it.
     if (active) finish(active)
+    const changes_route = op === 'pageload' || op === 'navigation'
+    if (changes_route) report_interactions()
     const trace_id = new_trace_id()
     const transaction = {
       trace_id,
@@ -135,9 +164,63 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
       finish(transaction)
     }, max_transaction_ms)
     active = transaction
+    if (changes_route) {
+      route = transaction
+      observe_interactions()
+    }
     if (transaction.sampled) on_start?.(transaction)
     schedule_idle(transaction)
     return transaction
+  }
+
+  /** Records the interactions of the page as they happen (the Event Timing API). */
+  function observe_interactions() {
+    if (observing_interactions || typeof PerformanceObserver === 'undefined') return
+    observing_interactions = true
+    const origin = typeof performance !== 'undefined' && performance.timeOrigin ? performance.timeOrigin : 0
+    try {
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          // Events that are not part of an interaction (a scroll, a mouse move) have none.
+          if (!entry.interactionId) continue
+          const known = interactions.get(entry.interactionId)
+          if (known) {
+            if (entry.duration > known.duration) known.duration = entry.duration
+          } else if (interactions.size < max_interactions) {
+            interactions.set(entry.interactionId, { duration: entry.duration, start: origin + entry.startTime })
+          }
+        }
+      }).observe({ type: 'event', durationThreshold: interaction_threshold_ms, buffered: true })
+    } catch {
+      // The browser does not time events.
+    }
+  }
+
+  /**
+   * Sends the route's INP, when anything was slow enough to count, as a
+   * transaction of the route's trace; then starts over. INP is the slowest
+   * interaction, with one skipped for every fifty on a busy route, as the metric
+   * is defined.
+   */
+  function report_interactions() {
+    const durations = [...interactions.values()]
+    interactions.clear()
+    if (!route?.sampled || durations.length === 0) return
+    durations.sort((a, b) => b.duration - a.duration)
+    const inp = durations[Math.min(Math.floor(durations.length / 50), durations.length - 1)]
+    send({
+      trace_id: route.trace_id,
+      span_id: new_span_id(),
+      parent_span_id: route.span_id,
+      name: route.name,
+      op: interaction_op,
+      status: 'ok',
+      start: new Date(inp.start).toISOString(),
+      duration_ms: inp.duration,
+      platform: 'javascript',
+      measurements: { inp: inp.duration },
+      spans: [],
+    })
   }
 
   /** Starts the page load's transaction, measured from the navigation start. */
@@ -167,7 +250,7 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
     const span = {
       span_id: new_span_id(),
       op: 'http.client',
-      description: `${method} ${url}`,
+      description: `${method} ${scrub_url(url)}`,
       status: 'ok',
       start: now_ms(),
       data: {},
@@ -208,6 +291,8 @@ export function create_tracer({ sample_rate = 0, propagation_targets = [], send,
     active: () => active,
     finish,
     finish_active: () => finish(active),
+    // Called when the page is hidden or left: the route's INP so far goes out.
+    report_interactions,
   }
 }
 
@@ -230,7 +315,7 @@ function observe_vitals(transaction) {
 }
 
 /** Adds the navigation timings and the loaded resources to a page load. */
-function add_page_load_details(transaction) {
+function add_page_load_details(transaction, scrub_url) {
   if (typeof performance === 'undefined' || !performance.getEntriesByType) return
   const origin = performance.timeOrigin || transaction.start
 
@@ -257,7 +342,7 @@ function add_page_load_details(transaction) {
     transaction.spans.push({
       span_id: new_span_id(),
       op: `resource.${resource.initiatorType || 'other'}`,
-      description: resource.name,
+      description: scrub_url(resource.name),
       status: 'ok',
       start: origin + resource.startTime,
       end: origin + resource.startTime + resource.duration,

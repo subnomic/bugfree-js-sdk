@@ -23,7 +23,7 @@ export const bugfree = create_bugfree({
 })
 
 // window.onerror + unhandledrejection, and breadcrumbs for fetch, XHR,
-// clicks, page changes and the console
+// WebSocket connections, clicks, page changes and the console
 bugfree.install()
 ```
 
@@ -68,6 +68,7 @@ bugfree.capture_message('cart recovered', { level: 'info' })
 
 bugfree.set_user({ id: user.id, email: user.email })
 bugfree.set_tag('plan', 'team')
+bugfree.set_tag('plan', null)   // null or undefined removes a tag
 bugfree.add_breadcrumb({ category: 'ui', message: 'clicked pay' })
 
 await bugfree.flush()   // before navigating away
@@ -117,6 +118,59 @@ mapping) are sent as-is — an error is never dropped because of a missing map.
 > is not acceptable, upload them to the release on your bugfree server instead,
 > leave them out of the deployment and set `resolve_source_maps: false`.
 
+### Without sending the code
+
+A map carries the complete original source in `sourcesContent`. To keep the code
+out of bugfree altogether, remove it before uploading the maps to the release:
+
+```bash
+npx -p @subnomic/bugfree-js bugfree-strip-sources dist/assets
+```
+
+Every `.map` under the folder keeps its mappings, sources and names, so frames
+still resolve to the original file, line and function; only the lines around the
+failing one are not shown. With a GitHub integration and a release created with
+its `commit_sha`, such a frame opens on GitHub at that commit instead. The link
+uses the paths the build wrote: in a monorepo, write them from the repository
+root, for instance with Vite's
+`build.rollupOptions.output.sourcemapPathTransform`.
+
+## Scrubbing addresses
+
+A page opened from an emailed link carries its token in the address, and the SDK
+sends addresses in many places: the request of an event, fetch, XHR and
+navigation breadcrumbs, span descriptions and the page load's name, replays (the
+page address, links and form targets), the scripts a profile lists, and
+feedback. `scrub_url` sees each of them before it leaves the browser, and before
+`before_send` and `before_send_transaction`:
+
+```js
+create_bugfree({
+  dsn: import.meta.env.VITE_BUGFREE_DSN,
+  scrub_url: (url) => url.replace(/\/invite\/[^/?#]+/, '/invite/:token').replace(/([?&]token=)[^&#]+/, '$1:token'),
+})
+```
+
+A hook that throws, or returns anything but a string, sends `[Filtered]` in place
+of the address. The addresses of the scripts in stack frames are left as they are:
+source maps are found by them.
+
+## Content Security Policy
+
+A request the page's policy blocks leaves no trace on any server. The SDK records
+every violation as a breadcrumb (category `csp`: the directive, the blocked
+address and the script that tried), and with `report_csp_violations: true` sends
+it as a warning event too, one issue per directive and blocked origin. Violations
+caused by browser extensions are left out.
+
+Pages without the SDK can report the same way: point the policy at the project's
+csp address, which takes both report formats.
+
+```
+Reporting-Endpoints: bugfree="https://bugfree.example.com/ingest/v1/<public-key>/csp"
+Content-Security-Policy: default-src 'self'; report-uri https://bugfree.example.com/ingest/v1/<public-key>/csp; report-to bugfree
+```
+
 ## Options
 
 | Option | Default | Meaning |
@@ -129,15 +183,18 @@ mapping) are sent as-is — an error is never dropped because of a missing map.
 | `max_breadcrumbs` | `30` | Ring buffer size. |
 | `dedupe_window_ms` | `10000` | Same error is sent once per window. |
 | `ignore_errors` | `[]` | Strings or RegExps; drops errors whose `Type: message` matches. |
-| `traces_sample_rate` | `0` | Share of page loads and navigations timed, with requests as spans and web vitals. |
+| `traces_sample_rate` | `0` | Share of page loads and navigations timed, with requests as spans and web vitals; a route's INP is sent when it is left or the page is hidden, as a `ui.interaction` transaction of its trace. |
 | `replays_on_error_sample_rate` | `0` | Share of page loads that keep their last minute of session replay and send it with an error. |
 | `replays_session_sample_rate` | `0` | Share of page loads recorded as a session replay from start to end. |
 | `replay_mask_all_text` | `true` | Mask every text in replays (input values are always masked). |
-| `profiles_sample_rate` | `0` | Share of timed transactions profiled with the JS Self-Profiling API (Chromium, page served with `Document-Policy: js-profiling`). |
+| `profiles_sample_rate` | `0` | Share of timed transactions profiled with the JS Self-Profiling API (Chromium, page served with `Document-Policy: js-profiling`). A profile is sent only with its transaction. |
 | `trace_propagation_targets` | `[]` | Other origins whose requests carry the `traceparent` header. |
 | `track_sessions` | `true` | Report every page load as a session of the release, for release health. |
 | `deny_urls` | `[]` | Strings or RegExps; drops errors thrown by scripts at these addresses. |
+| `report_csp_violations` | `false` | Send every Content-Security-Policy violation as a warning event; see [Content Security Policy](#content-security-policy). |
+| `scrub_url` | `null` | Rewrites every address the SDK sends before the other hooks run; see [Scrubbing addresses](#scrubbing-addresses). |
 | `before_send` | `null` | Return `null` to drop, or edit the event. |
+| `before_send_transaction` | `null` | The same for a timed transaction, which `before_send` never sees: its spans carry request and resource addresses, query string included. |
 | `debug` | `false` | Warn to the console about SDK problems. |
 
 ## Tests
@@ -150,12 +207,12 @@ node --test test/*.test.mjs
 
 The SDK is published to `github.com/subnomic/bugfree-js-sdk`, with this
 directory as that repository's root, and to npm, by the bugfree release: one
-release on the bugfree repository's Releases page with the tag `v0.9.2` publishes
+release on the bugfree repository's Releases page with the tag `v0.9.4` publishes
 the server and both SDKs at that version. Raise `version` in `package.json` and
 `VERSION` in `src/index.js` with the others.
 
 The release workflow checks that both versions match the tag, runs the tests,
-pushes this directory to that repository as one commit, tags it there as `v0.9.2`
+pushes this directory to that repository as one commit, tags it there as `v0.9.4`
 and publishes the package to npm (under `next` for a pre-release).
 
 ## License
